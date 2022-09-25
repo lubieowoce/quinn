@@ -11,12 +11,14 @@ use parser::parse_file;
 
 
 type Ident = String;
+type IdentRaw = str;
+
 type Scope = HashMap<Ident, JsPrim>;
 
 #[derive(Debug, Clone, PartialEq)]
 enum JsOp {
     Nop,
-    DeclareVar { name: Ident, init: IrVal },
+    DeclareVar { name: IrIdent, init: IrVal },
     SetVar { target: IrIdent, value: IrVal },
     DoBinOp { target: IrIdent, op: BinOp, lhs: IrVal, rhs: IrVal },
 }
@@ -36,10 +38,10 @@ impl From<&PrimExprVal> for IrVal {
 }
 
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum IrIdent {
     Ident(Ident),
-    Tmp(i64),
+    Tmp(usize),
 }
 // TODO: is separating these two even necessary?
 impl From<&PrimExprIdent> for IrIdent {
@@ -72,8 +74,34 @@ fn main() {
     let module_ast = parse_file(Path::new("test/test.js"))
         .expect("Error while loading source file, exiting");
     println!("{:#?}", module_ast);
-    println!("{:#?}", module_to_ir(module_ast));
+
+    let code = module_to_ir(module_ast)
+        .expect("Error compiling source file, exiting");
+    println!("{:#?}", code);
+    match run_block(code) {
+        Ok(js_val) => println!("==> {:#?}", js_val),
+        Err(err) => println!("error: {:#?}", err),
+    }
 }
+
+fn run_block(code: Vec<JsOp>) -> Result<JsVal, RuntimeError> {
+    let mut frame = ExecutionFrame {
+        code: &code,
+        instruction_ix: 0,
+        tmp: vec![JsVal::Undefined; 8],
+        vars: HashMap::new()
+    };
+    while frame.instruction_ix < code.len() {
+        try_step_frame(&mut frame)?;
+    }
+    let last_value = frame.tmp[0];
+    Ok(last_value)
+}
+
+
+//==============================
+// Compiler
+//==============================
 
 #[derive(Debug, Clone)]
 enum CompileError {
@@ -93,7 +121,7 @@ fn module_to_ir(module_ast: ast::Module) -> Result<Vec<JsOp>, CompileError> {
 
 #[derive(Debug, Clone, PartialEq)]
 struct StmtToIrCtx {
-    uniq: i64,
+    uniq: usize,
     block: Vec<JsOp>,
 }
 
@@ -143,7 +171,7 @@ fn stmt_to_ir(stmt_ast: &ast::Stmt, ctx: &mut StmtToIrCtx) -> Result<(), Compile
                     },
                     None => IrVal::Const(JsPrim::Undefined),
                 };
-                ctx.emit_op(JsOp::DeclareVar { name, init })
+                ctx.emit_op(JsOp::DeclareVar { name: IrIdent::Ident(name), init })
             }
             Ok(())
         },
@@ -164,7 +192,7 @@ fn stmt_to_ir(stmt_ast: &ast::Stmt, ctx: &mut StmtToIrCtx) -> Result<(), Compile
 
 
 
-fn expr_to_ir(expr_ast: &ast::Expr, uniq: i64) -> Result<(PrimExprCtx, PrimExprVal), CompileError> {
+fn expr_to_ir(expr_ast: &ast::Expr, uniq: usize) -> Result<(PrimExprCtx, PrimExprVal), CompileError> {
     let mut ctx = PrimExprCtx { setup: vec![], uniq };
     let final_prim = expr_to_prims(expr_ast, &mut ctx);
     Ok((ctx, final_prim))
@@ -197,7 +225,7 @@ enum PrimExprVal {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum PrimExprIdent { Tmp(i64), Ident(Ident) }
+enum PrimExprIdent { Tmp(usize), Ident(Ident) }
 
 
 type PrimExprs = Vec<(PrimExprIdent, PrimExpr)>;
@@ -206,7 +234,7 @@ type PrimExprs = Vec<(PrimExprIdent, PrimExpr)>;
 struct PrimExprCtx {
     setup: PrimExprs,
     // referenced_idents: HashSet<Ident>,
-    uniq: i64,
+    uniq: usize,
 }
 
 impl PrimExprCtx {
@@ -304,31 +332,151 @@ fn ast_ident_to_name(ident: &ast::Ident) -> String {
     ident.sym.to_string()
 }
 
-// fn eval(expr: &Expr, env: &Env) -> Result<i64, String> {
-//     match expr {
-//         Expr::Num(n) => Ok(*n),
-//         Expr::Add(left, right) => Ok(eval(*left, env)? + eval(*right, env)?),
-//         Expr::Mul(left, right) => Ok(eval(*left, env)? * eval(*right, env)?),
-//         Expr::Div(left, right) => {
-//             let r = eval(right, env)?;
-//             if r == 0 {
-//                 Err("division by zero".to_string())
-//             } else {
-//                 Ok(eval(left, env)? / r)
-//             }
-//         },
-//         Expr::Let(name, rhs, body) => {
-//             let rhs_val = eval(rhs, env)?;
-//             let mut env2 = env.clone();
-//             env2.insert(name.clone(), rhs_val);
-//             eval(body, &env2)
-//         }
-//         Expr::Var(name) => {
-//             match env.get(name) {
-//                 Some(val) => Ok(*val),
-//                 None => Err("Undefined variable: ".to_owned() + name)
-//             }
-//         }
-//         _ => Err("Not implemented".to_string())
-//     }
-// }
+
+
+//==============================
+// VM
+//==============================
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum JsVal {
+    Number(JsNumber),
+    Undefined,
+}
+
+impl From<&JsPrim> for JsVal {
+    fn from(src: &JsPrim) -> Self {
+        match src {
+            JsPrim::Number(num) => JsVal::Number(*num),
+            JsPrim::Undefined => JsVal::Undefined,
+        }
+    }
+}
+
+
+
+#[derive(Debug)]
+enum RuntimeError {
+    UndefinedVariable(String),
+    UnsupportedOperand(BinOp),
+    DivByZero,
+    Internal(InternalError),
+}
+
+#[derive(Debug)]
+enum InternalError {
+    InvalidTmpVar(usize),
+}
+
+struct ExecutionFrame<'a> {
+    vars: HashMap<&'a IdentRaw, JsVal>,
+    tmp: Vec<JsVal>,
+    instruction_ix: usize,
+    code: &'a [JsOp],
+}
+
+fn frame_set_ident<'a>(frame: &mut ExecutionFrame<'a>, ident: &'a IrIdent, val: JsVal) -> Result<(), RuntimeError> {
+    match ident {
+        IrIdent::Ident(name) => {
+            // TODO: error checking!!!
+            frame.vars.insert(name, val);
+            Ok(())
+        }
+        IrIdent::Tmp(id) => {
+            let ix = *id;
+            // FIXME: THIS FEELS LIKE A REALLY DUMB WAY TO GO ABOUT IT
+            // at least, like, round to nearest power of two or something
+            if ix > frame.tmp.len() {
+                frame.tmp.resize(ix, JsVal::Undefined);
+            }
+            frame.tmp[ix] = val;
+            Ok(())
+        },
+    }
+}
+
+fn frame_get_val(frame: &ExecutionFrame, ir_val: &IrVal) -> Result<JsVal, RuntimeError> {
+    match ir_val {
+        IrVal::Ident(ident) => frame_get_ident(frame, ident),
+        IrVal::Const(prim) => {
+            Ok(prim.into())
+        }
+    }
+}
+
+fn frame_get_ident(frame: &ExecutionFrame, ident: &IrIdent) -> Result<JsVal, RuntimeError> {
+    match ident {
+        IrIdent::Ident(name) => {
+            match frame.vars.get(name.as_str()) {
+                Some(val) => Ok(*val),
+                None => Err(RuntimeError::UndefinedVariable(name.clone())),
+            }
+        }
+        IrIdent::Tmp(id) => {
+            match frame.tmp.get(*id) {
+                Some(val) => Ok(*val),
+                None => Err(RuntimeError::Internal(InternalError::InvalidTmpVar(*id)))
+            }
+        },
+    }
+}
+
+fn frame_advance_instr(frame: &mut ExecutionFrame) {
+    frame.instruction_ix += 1;
+}
+
+fn try_step_frame<'a>(frame: &mut ExecutionFrame<'a>) -> Result<(), RuntimeError> {
+    let instruction = &frame.code[frame.instruction_ix];
+    match instruction {
+        JsOp::DoBinOp { target, op, lhs, rhs } => {
+            let lhs_val = frame_get_val(frame, lhs)?;
+            let rhs_val = frame_get_val(frame, rhs)?;
+            let res = do_binop(*op, lhs_val, rhs_val)?;
+            frame_set_ident(frame, target, res)?;
+            frame_advance_instr(frame);
+            Ok(())
+        },
+        JsOp::Nop => {
+            frame_advance_instr(frame);
+            Ok(())
+        },
+        JsOp::DeclareVar { name, init: ir_val } => {
+            // TODO: track variables declared in scope
+            // (ignoring for now)
+            let val = frame_get_val(frame, ir_val)?;
+            frame_set_ident(frame, name, val)?;
+            frame_advance_instr(frame);
+            Ok(())
+        },
+        JsOp::SetVar { target, value: ir_val } => {
+            let val = frame_get_val(frame, ir_val)?;
+            frame_set_ident(frame, target, val)?;
+            frame_advance_instr(frame);
+            Ok(())
+        },
+    }
+}
+
+fn do_binop(op: BinOp, lhs: JsVal, rhs: JsVal) -> Result<JsVal, RuntimeError> {
+    match (lhs, rhs) {
+        (JsVal::Number(lhs_num), JsVal::Number(rhs_num)) => {
+            let res = do_binop_number(op, lhs_num, rhs_num)?;
+            Ok(JsVal::Number(res))
+        },
+        _ => Err(RuntimeError::UnsupportedOperand(BinOp::Add))
+    }
+}
+
+fn do_binop_number(op: BinOp, lhs: JsNumber, rhs: JsNumber) -> Result<JsNumber, RuntimeError> {
+    match op {
+        BinOp::Add => Ok(lhs + rhs),
+        BinOp::Mul => Ok(lhs * rhs),
+        BinOp::Div => {
+            if rhs == 0.0 {
+                Err(RuntimeError::DivByZero)
+            } else {
+                Ok(lhs / rhs)
+            }
+        },
+    }
+}
